@@ -1,6 +1,7 @@
 package com.training.notificationservice.service.impl;
 
 import com.training.notificationservice.dto.request.NotificationRequestDto;
+import com.training.notificationservice.dto.request.OrderConfirmationRequestDto;
 import com.training.notificationservice.dto.response.NotificationResponseDto;
 import com.training.notificationservice.entity.Notification;
 import com.training.notificationservice.enums.NotificationChannel;
@@ -8,7 +9,6 @@ import com.training.notificationservice.enums.NotificationStatus;
 import com.training.notificationservice.exception.NotificationNotFoundException;
 import com.training.notificationservice.repository.NotificationRepository;
 import com.training.notificationservice.repository.NotificationSpecifications;
-import com.training.notificationservice.service.NotificationSender;
 import com.training.notificationservice.service.NotificationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,21 +17,14 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /**
- * Orchestrates notification creation, lookup, and search.
- * <p>
- * Dispatch uses the Strategy pattern: {@link NotificationSender} implementations
- * register themselves as Spring beans (one per {@link NotificationChannel}), and
- * this class picks the right one at runtime via {@code sendersByChannel}. Adding
- * a new channel means adding a new {@code @Component}, not editing this class
- * (Open/Closed Principle) - which is what lets Developers 2-4 build their slices
- * without ever touching Developer 1's files.
+ * Orchestrates notification creation, lookup, and search. Channel delivery is
+ * delegated to {@link AsyncNotificationDispatcher} - synchronously for the
+ * direct create endpoints (which return the final SENT/FAILED status), and
+ * asynchronously for the inter-service order-confirmation endpoint (which
+ * accepts the request and lets delivery finish in the background).
  */
 @Service
 public class NotificationServiceImpl implements NotificationService {
@@ -39,13 +32,12 @@ public class NotificationServiceImpl implements NotificationService {
     private static final Logger log = LoggerFactory.getLogger(NotificationServiceImpl.class);
 
     private final NotificationRepository notificationRepository;
-    private final Map<NotificationChannel, NotificationSender> sendersByChannel;
+    private final AsyncNotificationDispatcher dispatcher;
 
     public NotificationServiceImpl(NotificationRepository notificationRepository,
-                                    List<NotificationSender> senders) {
+                                    AsyncNotificationDispatcher dispatcher) {
         this.notificationRepository = notificationRepository;
-        this.sendersByChannel = senders.stream()
-                .collect(Collectors.toMap(NotificationSender::getChannel, Function.identity()));
+        this.dispatcher = dispatcher;
     }
 
     @Override
@@ -56,10 +48,58 @@ public class NotificationServiceImpl implements NotificationService {
         Notification notification = toEntity(request);
         Notification saved = notificationRepository.save(notification);
 
-        dispatch(saved);
+        dispatcher.dispatch(saved);
 
         log.info("Notification {} persisted with status={}", saved.getId(), saved.getStatus());
         return toResponseDto(saved);
+    }
+
+    /**
+     * Accept-and-dispatch-later flow for the Order Service. Deliberately NOT
+     * {@code @Transactional}: the save commits in its own transaction so the row
+     * is visible when {@link AsyncNotificationDispatcher#dispatchAsync(UUID)}
+     * reloads it on the background thread. Returns immediately with status
+     * PENDING - the caller gets a fast 202 instead of waiting for the SMTP send.
+     */
+    @Override
+    public NotificationResponseDto createOrderConfirmation(OrderConfirmationRequestDto request) {
+        log.info("Accepting order-confirmation notification for order={} recipient={}",
+                request.getOrderId(), mask(request.getCustomerEmail()));
+
+        NotificationRequestDto generic = new NotificationRequestDto();
+        generic.setRecipient(request.getCustomerEmail());
+        generic.setChannel(NotificationChannel.EMAIL);
+        generic.setSubject("Order #" + request.getOrderId() + " confirmed");
+        generic.setMessage(buildConfirmationMessage(request));
+
+        Notification saved = notificationRepository.save(toEntity(generic));
+        dispatcher.dispatchAsync(saved.getId());
+
+        log.info("Notification {} accepted (status={}); delivery running asynchronously",
+                saved.getId(), saved.getStatus());
+        return toResponseDto(saved);
+    }
+
+    /** Renders the order details into a human-readable email body. */
+    private String buildConfirmationMessage(OrderConfirmationRequestDto request) {
+        StringBuilder body = new StringBuilder();
+        String name = request.getCustomerName() == null || request.getCustomerName().isBlank()
+                ? "there" : request.getCustomerName();
+        body.append("Hi ").append(name).append(",\n\n")
+                .append("Thanks for your order! Order #").append(request.getOrderId())
+                .append(" has been confirmed.\n\n");
+
+        if (request.getItems() != null) {
+            body.append("Items:\n");
+            request.getItems().forEach(item ->
+                    body.append("  - ").append(item.getProductName())
+                            .append(" x ").append(item.getQuantity()).append('\n'));
+        }
+
+        if (request.getTotalAmount() != null) {
+            body.append("\nTotal: ").append(request.getTotalAmount());
+        }
+        return body.toString();
     }
 
     @Override
@@ -81,31 +121,6 @@ public class NotificationServiceImpl implements NotificationService {
         return notificationRepository
                 .findAll(NotificationSpecifications.filterBy(recipient, status, channel), pageable)
                 .map(this::toResponseDto);
-    }
-
-    /**
-     * Attempts delivery through the sender registered for this notification's
-     * channel. If no channel implementation has been added yet (Developers 2-4's
-     * PRs not merged), the notification is simply left in its current status
-     * rather than treated as an error.
-     */
-    private void dispatch(Notification notification) {
-        NotificationSender sender = sendersByChannel.get(notification.getChannel());
-        if (sender == null) {
-            log.info("No sender registered yet for channel={}; leaving notification {} as {}",
-                    notification.getChannel(), notification.getId(), notification.getStatus());
-            return;
-        }
-        try {
-            sender.send(notification);
-            notification.setStatus(NotificationStatus.SENT);
-        } catch (Exception ex) {
-            log.error("Dispatch failed for notification {} on channel {}: {}",
-                    notification.getId(), notification.getChannel(), ex.getMessage(), ex);
-            notification.setRetryCount(notification.getRetryCount() + 1);
-            notification.setStatus(NotificationStatus.FAILED);
-        }
-        notificationRepository.save(notification);
     }
 
     private Notification toEntity(NotificationRequestDto request) {

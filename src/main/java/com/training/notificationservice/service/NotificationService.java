@@ -1,6 +1,7 @@
 package com.training.notificationservice.service;
 
 import com.training.notificationservice.dto.request.NotificationRequestDto;
+import com.training.notificationservice.dto.request.OrderConfirmationRequestDto;
 import com.training.notificationservice.dto.response.NotificationResponseDto;
 import com.training.notificationservice.enums.NotificationChannel;
 import com.training.notificationservice.enums.NotificationStatus;
@@ -17,6 +18,12 @@ import java.util.UUID;
 public interface NotificationService {
 
     NotificationResponseDto createNotification(NotificationRequestDto request);
+
+    /**
+     * Turns an order-confirmation event from the Order Service into a formatted
+     * EMAIL notification and dispatches it through the standard pipeline.
+     */
+    NotificationResponseDto createOrderConfirmation(OrderConfirmationRequestDto request);
 
     NotificationResponseDto getNotificationById(UUID id);
 
