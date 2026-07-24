@@ -1,0 +1,13 @@
+# Keep the build context small and secrets out of the image.
+target/
+.git/
+.gitignore
+.idea/
+*.iml
+
+# Never ship local secrets into the image.
+**/application-secrets.properties
+
+# Docs / local junk
+*.pdf
+*.md
